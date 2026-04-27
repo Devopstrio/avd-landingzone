@@ -1,0 +1,77 @@
+name: 'AVD Landing Zone CD'
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'apps/**'
+      - 'backend/**'
+      - 'terraform/**'
+      - '.github/workflows/deploy.yml'
+
+jobs:
+  validate-and-scan:
+    name: 'Policy & IaC Validation'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Source
+      uses: actions/checkout@v3
+
+    - name: Run Checkov (IaC Scan)
+      uses: bridgecrewio/checkov-action@master
+      with:
+        directory: ./terraform
+        framework: terraform
+
+    - name: Terraform Init
+      run: terraform init
+      working-directory: ./terraform
+
+    - name: Terraform Plan
+      run: terraform plan
+      working-directory: ./terraform
+      env:
+        ARM_CLIENT_ID: ${{ secrets.AZ_CLIENT_ID }}
+        ARM_CLIENT_SECRET: ${{ secrets.AZ_CLIENT_SECRET }}
+        ARM_SUBSCRIPTION_ID: ${{ secrets.AZ_SUBSCRIPTION_ID }}
+        ARM_TENANT_ID: ${{ secrets.AZ_TENANT_ID }}
+
+  build-and-push:
+    name: 'Build Platform Containers'
+    needs: validate-and-scan
+    runs-on: ubuntu-latest
+    steps:
+    - name: Azure ACR Login
+      uses: azure/docker-login@v1
+      with:
+        login-server: acrlz.azurecr.io
+        username: ${{ secrets.ACR_USERNAME }}
+        password: ${{ secrets.ACR_PASSWORD }}
+
+    - name: Build API Gateway
+      run: |
+        docker build -t acrlz.azurecr.io/devopstrio/lz-api:${{ github.sha }} ./backend
+        docker push acrlz.azurecr.io/devopstrio/lz-api:${{ github.sha }}
+
+  helm-rollout:
+    name: 'Deploy Orchestration Layer'
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+    - name: Azure CLI Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: AKS Set Context
+      uses: azure/aks-set-context@v3
+      with:
+        resource-group: 'rg-avd-mgt-hub-prd'
+        cluster-name: 'aks-avd-lz-prd'
+
+    - name: Helm Deployment
+      run: |
+        helm upgrade --install avd-lz ./helm/avd-landingzone \
+        --namespace avd-lz-prod --create-namespace \
+        --set api.image.tag=${{ github.sha }}
